@@ -84,8 +84,9 @@ async fn main() {
         });
 
     // 设置健康检查API
+    let app_state_health = app_state.clone();
     let health_route = warp::path!("api" / "health").map(move || {
-        let state = app_state.lock().unwrap();
+        let state = app_state_health.lock().unwrap();
         let uav_count = state.uavs.len();
         warp::reply::json(&serde_json::json!({
             "status": "ok",
@@ -132,6 +133,7 @@ async fn main() {
     let port = 3001;
     log::info!("服务器运行在: http://localhost:{}", port);
     
+    // 同时监听IPv4和IPv6
     warp::serve(routes).run(([0, 0, 0, 0], port)).await;
 }
 
@@ -147,9 +149,15 @@ async fn handle_websocket(
 
     // 发送当前所有无人机数据
     {
-        let state = state.lock().unwrap();
-        for uav in state.uavs.values() {
-            let message = WSMessage::UavUpdate(uav.clone());
+        // 先获取数据，然后释放锁，再发送数据
+        let uavs: Vec<UAV> = {
+            let state = state.lock().unwrap();
+            state.uavs.values().cloned().collect()
+        };
+        
+        // 锁已经释放，现在可以安全地跨越异步边界
+        for uav in uavs {
+            let message = WSMessage::UavUpdate(uav);
             let json = serde_json::to_string(&message).unwrap();
             if let Err(e) = ws_tx.send(Message::text(json)).await {
                 log::error!("发送无人机数据失败: {}", e);
@@ -248,29 +256,57 @@ async fn add_random_uav(app_state: Arc<Mutex<AppState>>, broadcaster: Arc<broadc
     };
     
     if should_add {
-        let new_uav = {
-            let mut state = app_state.lock().unwrap();
-            let uav = generate_random_uav(&state.radar);
-            state.uavs.insert(uav.id.clone(), uav.clone());
-            uav
+        // 先获取雷达信息，不持有锁引用
+        let radar = {
+            let state = app_state.lock().unwrap();
+            state.radar.clone()
         };
         
+        // 生成无人机
+        let uav = generate_random_uav(&radar);
+        
+        // 将无人机添加到状态中
+        {
+            let mut state = app_state.lock().unwrap();
+            state.uavs.insert(uav.id.clone(), uav.clone());
+        }
+        
         // 广播新无人机数据
-        let message = WSMessage::UavUpdate(new_uav.clone());
+        let message = WSMessage::UavUpdate(uav.clone());
         let _ = broadcaster.send(message);
         
         log::info!(
             "添加新无人机: {}, 危险状态: {}",
-            new_uav.id,
-            new_uav.is_dangerous
+            uav.id,
+            uav.is_dangerous
         );
     }
+}
+
+// 计算两点间距离（单位：米）
+fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let r = 6371000.0; // 地球半径，单位米
+    let d_lat = (lat2 - lat1) * PI / 180.0;
+    let d_lon = (lon2 - lon1) * PI / 180.0;
+    let a = 
+        (d_lat / 2.0).sin() * (d_lat / 2.0).sin() +
+        (lat1 * PI / 180.0).cos() * (lat2 * PI / 180.0).cos() * 
+        (d_lon / 2.0).sin() * (d_lon / 2.0).sin();
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    r * c
 }
 
 // 更新所有无人机位置
 async fn update_uavs_position(app_state: Arc<Mutex<AppState>>, broadcaster: Arc<broadcast::Sender<WSMessage>>) {
     let mut rng = thread_rng();
     let mut to_remove = Vec::new();
+    let mut updates = Vec::new();
+    
+    // 先获取雷达信息
+    let radar = {
+        let state = app_state.lock().unwrap();
+        state.radar.clone()
+    };
     
     // 更新无人机位置
     {
@@ -290,13 +326,13 @@ async fn update_uavs_position(app_state: Arc<Mutex<AppState>>, broadcaster: Arc<
             // 计算到雷达中心的距离
             let distance = calculate_distance(
                 new_lat, new_lon,
-                state.radar.latitude, state.radar.longitude,
+                radar.latitude, radar.longitude,
             );
             
             // 如果超出雷达范围，向雷达中心移动
-            if distance > state.radar.radius {
-                let dir_lat = state.radar.latitude - new_lat;
-                let dir_lon = state.radar.longitude - new_lon;
+            if distance > radar.radius {
+                let dir_lat = radar.latitude - new_lat;
+                let dir_lon = radar.longitude - new_lon;
                 
                 new_lat = uav.latitude + (rng.gen::<f64>() * 0.002 * dir_lat.signum());
                 new_lon = uav.longitude + (rng.gen::<f64>() * 0.002 * dir_lon.signum());
@@ -313,9 +349,8 @@ async fn update_uavs_position(app_state: Arc<Mutex<AppState>>, broadcaster: Arc<
                 uav.is_dangerous = !uav.is_dangerous;
             }
             
-            // 发送更新
-            let message = WSMessage::UavUpdate(uav.clone());
-            let _ = broadcaster.send(message);
+            // 存储更新
+            updates.push(uav.clone());
             
             // 随机移除无人机（低概率）
             if rng.gen::<f64>() > 0.97 {
@@ -329,23 +364,16 @@ async fn update_uavs_position(app_state: Arc<Mutex<AppState>>, broadcaster: Arc<
         }
     }
     
+    // 发送更新
+    for uav in updates {
+        let message = WSMessage::UavUpdate(uav);
+        let _ = broadcaster.send(message);
+    }
+    
     // 发送移除通知
     for id in to_remove {
         let message = WSMessage::UavRemove(id.clone());
         let _ = broadcaster.send(message);
         log::info!("移除无人机: {}", id);
     }
-}
-
-// 计算两点间距离（单位：米）
-fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let r = 6371000.0; // 地球半径，单位米
-    let d_lat = (lat2 - lat1) * PI / 180.0;
-    let d_lon = (lon2 - lon1) * PI / 180.0;
-    let a = 
-        (d_lat / 2.0).sin() * (d_lat / 2.0).sin() +
-        (lat1 * PI / 180.0).cos() * (lat2 * PI / 180.0).cos() * 
-        (d_lon / 2.0).sin() * (d_lon / 2.0).sin();
-    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-    r * c
 }
